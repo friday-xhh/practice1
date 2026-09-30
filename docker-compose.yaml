@@ -1,0 +1,163 @@
+# 本机开发用的中间件全套。
+# 目标：一条命令 `docker compose up -d` 起全部依赖，且全部带 healthcheck。
+#
+# 端口规划：
+#   Redpanda 外部 9092 / 内部 29092   Redpanda Console 8080
+#   Elasticsearch 9200                MongoDB 27017
+#   Redis 6379
+#
+# 资源上限合计约 2.5G，Docker Desktop 建议分配 >= 4G 内存。
+
+services:
+  # ---------------------------------------------------------------- Redpanda
+  # Kafka API 完全兼容，单容器、无 JVM / 无 Zookeeper，本机资源占用远低于原生 Kafka。
+  # 生产环境只需把 bootstrap servers 换成真 Kafka 地址，业务代码零改动。
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    container_name: cp-redpanda
+    # Seastar 启动时调用 perf_event_open()，在 Docker 默认能力集下会因缺少
+    # CAP_SYS_ADMIN 返回 EPERM 并直接中止进程：
+    #   "ERROR seastar - Operation not permitted"
+    # 授予 capability 后仍可能失败（老版本 Docker Desktop 的内核/seccomp 限制），
+    # 此时需要同时放开 seccomp。
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      # Seastar 要求足额物理内存，且会校验容器可用值。
+      # 若这里写 1G 而容器上限也是 1G，实际可用(约 958MB)不足会直接退出：
+      #   "insufficient physical memory: needed 1073741824 available ..."
+      # 因此需求设为 512M，容器上限放宽到 1536M 留出余量。
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      # 内部监听器给容器间通信，外部监听器给宿主机（Windows 本机）访问
+      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+      - --default-log-level=warn
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: cp-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "false"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/ | grep -q Redpanda || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ----------------------------------------------------------- Elasticsearch
+  # 单节点 + 关闭安全认证，避免本机连不上；heap 限制在 512m。
+  # 注意：8.x 默认开启 xpack.security，必须显式关闭。
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: cp-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.monitoring.collection.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.routing.allocation.disk.threshold_enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ----------------------------------------------------------------- MongoDB
+  # 用于存放半结构化的审核快照（字段频繁变动，关系型会天天改表）。
+  mongodb:
+    image: mongo:7.0
+    container_name: cp-mongodb
+    # 不要用 --logpath /dev/null：会把启动失败原因一起丢掉，无法排查
+    command: ["--quiet"]
+    # MongoDB 会创建大量线程，默认 nproc 限制下会抛 std::system_error 并 exit 14
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    pids_limit: 65535
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping')\" || exit 1"]
+      interval: 15s
+      timeout: 8s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # -------------------------------------------------------------------- Redis
+  # 幂等键 + 令牌桶限流 + 后续的热点查询缓存。
+  redis:
+    image: redis:7.4-alpine
+    container_name: cp-redis
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+volumes:
+  redpanda-data:
+  es-data:
+  mongo-data:

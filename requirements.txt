@@ -1,0 +1,16 @@
+# 运行时依赖。Windows / Linux 通用，版本号锁死以保证复现。
+# Python 3.11
+
+Flask==3.0.3
+Werkzeug==3.0.6
+
+# 配置与数据校验
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# 结构化日志
+structlog==24.4.0
+
+# 中间件客户端
+redis==5.2.1
+confluent-kafka==2.8.0
