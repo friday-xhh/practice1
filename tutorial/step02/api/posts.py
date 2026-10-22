@@ -68,6 +68,8 @@ def submit_post():
             author_id=author_id,
             remaining_tokens=remaining,
         )
+        if config.RATE_REFILL_PER_SEC <= 0:
+            return None
         return error_response(
             "rate_limited",
             "提交过于频繁，请稍后再试",
